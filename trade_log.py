@@ -79,9 +79,76 @@ def init_db():
         )
     ''')
 
+    # Paper portfolio state (singleton row)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS portfolio (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton row
+            starting_balance REAL NOT NULL DEFAULT 10000.0,
+            balance         REAL NOT NULL DEFAULT 10000.0,       -- available cash
+            peak_equity     REAL NOT NULL DEFAULT 10000.0,       -- for drawdown calc
+            total_pnl       REAL NOT NULL DEFAULT 0.0,           -- cumulative realised P&L
+            total_fees      REAL NOT NULL DEFAULT 0.0,           -- cumulative fees paid
+            trades_taken    INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )
+    ''')
+
     conn.commit()
     conn.close()
     print(f"DB initialised at {DB_PATH}")
+
+
+# --- Portfolio methods ---
+
+def get_portfolio() -> dict:
+    """Get current portfolio state. Creates default if not exists."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM portfolio WHERE id = 1')
+    row = c.fetchone()
+    if row is None:
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute('''
+            INSERT INTO portfolio
+            (id, starting_balance, balance, peak_equity, total_pnl, total_fees,
+             trades_taken, created_at, updated_at)
+            VALUES (1, 10000.0, 10000.0, 10000.0, 0.0, 0.0, 0, ?, ?)
+        ''', (now, now))
+        conn.commit()
+        c.execute('SELECT * FROM portfolio WHERE id = 1')
+        row = c.fetchone()
+    result = dict(row)
+    conn.close()
+    return result
+
+
+def update_portfolio(updates: dict):
+    """Update portfolio fields."""
+    conn = get_conn()
+    c = conn.cursor()
+    updates['updated_at'] = datetime.now(timezone.utc).isoformat()
+    set_clause = ', '.join(f'{k} = ?' for k in updates)
+    values = list(updates.values())
+    c.execute(f'UPDATE portfolio SET {set_clause} WHERE id = 1', values)
+    conn.commit()
+    conn.close()
+
+
+def reset_portfolio(starting_balance: float = 10000.0):
+    """Reset portfolio to starting state."""
+    conn = get_conn()
+    c = conn.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    c.execute('DELETE FROM portfolio')
+    c.execute('''
+        INSERT INTO portfolio
+        (id, starting_balance, balance, peak_equity, total_pnl, total_fees,
+         trades_taken, created_at, updated_at)
+        VALUES (1, ?, ?, ?, 0.0, 0.0, 0, ?, ?)
+    ''', (starting_balance, starting_balance, starting_balance, now, now))
+    conn.commit()
+    conn.close()
 
 
 # --- Signal methods ---
