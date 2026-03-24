@@ -177,6 +177,77 @@ def reset_portfolio(starting_balance: float = 10000.0):
     conn.close()
 
 
+# --- Position sizing with leverage ---
+
+RISK_PER_TRADE_PCT = 0.01  # 1% of balance
+FEE_RATE = 0.001           # 0.1% per side (Binance futures)
+MIN_BALANCE = 500.0        # stop trading below this
+MAX_LEVERAGE = 20          # hard cap on leverage
+
+
+def calculate_position_size(
+    balance: float,
+    entry_price: float,
+    stop_loss: float,
+    leverage: int = 1,
+) -> dict:
+    """
+    Calculate position size based on 1% risk rule with leverage.
+    
+    Leverage amplifies position size but not the risk amount.
+    E.g. $10k balance, 1% risk = $100 risk. With 5x leverage the
+    notional position is larger, but the margin (collateral) used
+    is position_size / leverage.
+    
+    Returns dict with:
+        risk_amount: dollars at risk (always 1% of balance)
+        position_size: notional position in USD (amplified by leverage)
+        margin_used: actual collateral locked (position_size / leverage)
+        quantity: amount of BTC
+        entry_fee: fee on entry (based on notional)
+        leverage: validated leverage used
+        can_trade: whether balance supports this trade
+    """
+    leverage = max(1, min(int(leverage), MAX_LEVERAGE))
+    
+    risk_amount = balance * RISK_PER_TRADE_PCT
+    sl_distance_pct = abs(entry_price - stop_loss) / entry_price
+    
+    if sl_distance_pct == 0:
+        return {'can_trade': False, 'reason': 'SL distance is zero'}
+    
+    # Position size = risk / SL distance (base sizing from risk)
+    position_size = risk_amount / sl_distance_pct
+    
+    # Apply leverage: allows notional to exceed balance
+    # But margin (collateral) must fit within balance
+    max_notional = balance * leverage
+    if position_size > max_notional:
+        position_size = max_notional
+        risk_amount = position_size * sl_distance_pct
+    
+    margin_used = position_size / leverage
+    quantity = position_size / entry_price
+    entry_fee = position_size * FEE_RATE
+    
+    # Check margin + fee fits in balance
+    if margin_used + entry_fee > balance:
+        return {'can_trade': False, 'reason': f'Insufficient margin: need ${margin_used + entry_fee:.2f}, have ${balance:.2f}'}
+    
+    if balance < MIN_BALANCE:
+        return {'can_trade': False, 'reason': f'Balance ${balance:.2f} below minimum ${MIN_BALANCE:.2f}'}
+    
+    return {
+        'can_trade': True,
+        'risk_amount': round(risk_amount, 2),
+        'position_size': round(position_size, 2),
+        'margin_used': round(margin_used, 2),
+        'quantity': round(quantity, 8),
+        'entry_fee': round(entry_fee, 2),
+        'leverage': leverage,
+    }
+
+
 # --- Signal methods ---
 
 def log_signal(
