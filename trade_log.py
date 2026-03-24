@@ -369,7 +369,7 @@ def close_position(
     exit_reason: str,
 ) -> dict:
     """
-    Close a paper position. Calculates P&L.
+    Close a paper position. Calculates P&L in dollars and updates portfolio.
     Returns the closed position dict.
     """
     conn = get_conn()
@@ -388,15 +388,34 @@ def close_position(
         pnl_pct = (entry - exit_price) / entry * 100
         pnl_r   = (entry - exit_price) / risk if risk > 0 else 0
 
+    # Dollar P&L calculation
+    position_size = pos.get('position_size') or 0
+    if position_size > 0:
+        if pos['direction'] == 'LONG':
+            pnl_usd = position_size * (exit_price - entry) / entry
+        else:
+            pnl_usd = position_size * (entry - exit_price) / entry
+        
+        exit_fee = position_size * FEE_RATE
+        pnl_usd_net = pnl_usd - exit_fee
+        total_fees = (pos.get('fees') or 0) + exit_fee
+    else:
+        # Legacy positions without sizing
+        pnl_usd = 0
+        exit_fee = 0
+        pnl_usd_net = 0
+        total_fees = pos.get('fees') or 0
+
     c.execute('''
         UPDATE positions
         SET closed_at=?, exit_price=?, exit_reason=?,
-            pnl_pct=?, pnl_r=?, status='CLOSED'
+            pnl_pct=?, pnl_r=?, pnl_usd=?, fees=?, status='CLOSED'
         WHERE id=?
     ''', (
         datetime.now(timezone.utc).isoformat(),
         exit_price, exit_reason,
         round(pnl_pct, 4), round(pnl_r, 4),
+        round(pnl_usd, 2), round(total_fees, 2),
         position_id,
     ))
     conn.commit()
@@ -407,8 +426,28 @@ def close_position(
         'exit_reason': exit_reason,
         'pnl_pct': round(pnl_pct, 4),
         'pnl_r': round(pnl_r, 4),
+        'pnl_usd': round(pnl_usd, 2),  # Gross P&L (exit fee subtracted)
+        'fees': round(total_fees, 2),
         'status': 'CLOSED',
     })
+
+    # Update portfolio balance: return margin + apply net P&L
+    margin_used = pos.get('margin_used') or 0
+    portfolio = get_portfolio()
+    new_balance = portfolio['balance'] + margin_used + pnl_usd_net
+    new_total_pnl = portfolio['total_pnl'] + pnl_usd  # Gross P&L
+    new_total_fees = portfolio['total_fees'] + total_fees
+    new_trades = portfolio['trades_taken'] + 1
+    new_peak = max(portfolio['peak_equity'], new_balance)
+
+    update_portfolio({
+        'balance': round(new_balance, 2),
+        'total_pnl': round(new_total_pnl, 2),
+        'total_fees': round(new_total_fees, 2),
+        'trades_taken': new_trades,
+        'peak_equity': round(new_peak, 2),
+    })
+
     return pos
 
 
