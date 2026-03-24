@@ -1,0 +1,15 @@
+# Database
+trade_log.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp/state files
+.telegram_notify
+.pending_telegram_report
+query_trades.py
+
+# OS
+.DS_Store
