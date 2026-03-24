@@ -338,16 +338,24 @@ def _get_strategy_version() -> str:
 
 
 def notify_telegram(message: str):
-    """
-    Write message to a file that Hermes gateway picks up for Telegram delivery.
-    Hermes trader cron will handle actual delivery.
-    """
-    # This file is read by the Hermes cron job output — see market-scan.yaml
-    # In production, Hermes delivers the cron output directly to Telegram.
-    # We print it here so Hermes captures it as cron task output.
-    # Note: This function is deprecated for main scan notifications.
-    # See main() where ONE consolidated message is sent instead.
-    print(f"TELEGRAM_MSG::{message}")
+    """Send message directly via Telegram Bot API."""
+    bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+    if not bot_token or not chat_id:
+        print(f"[trader] WARN: Telegram credentials not set, skipping notification")
+        return
+    try:
+        resp = requests.post(
+            f'https://api.telegram.org/bot{bot_token}/sendMessage',
+            json={'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown'},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            print(f"[trader] Telegram notification sent")
+        else:
+            print(f"[trader] Telegram send failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[trader] Telegram send error: {e}")
 
 
 def main():
