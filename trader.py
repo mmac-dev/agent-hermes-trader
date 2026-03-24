@@ -115,6 +115,12 @@ RULES:
 - Only recommend trades with R:R >= {MIN_RR}
 - Only recommend if confidence >= {MIN_CONFIDENCE}% (lowered from 65% to improve trade frequency)
 - Currently {open_count}/{MAX_OPEN_POSITIONS} positions open — {'DO NOT open new trades, max reached.' if open_count >= MAX_OPEN_POSITIONS else 'can open new position.'}
+- Choose leverage 1-20x based on setup quality:
+  - 1x: uncertain/low confidence setups
+  - 2-5x: moderate confidence, aligned timeframes
+  - 5-10x: high confidence, strong trend alignment, clear levels
+  - 10-20x: exceptional setups only — all timeframes aligned, high volume, clear breakout
+- Higher leverage = higher risk. Be conservative unless the setup is exceptional.
 - Be conservative — no trade is better than a bad trade
 - You MUST respond in valid JSON only, no markdown, no preamble
 
@@ -126,6 +132,7 @@ RESPONSE FORMAT:
   "stop_loss": float or null,
   "take_profit": float or null,
   "rr_ratio": float or null,
+  "leverage": 1-20,
   "expected_duration": "e.g. 12-36 hours",
   "timeframe_alignment": {{
     "15m": "bullish" | "bearish" | "neutral" | "mixed",
@@ -234,7 +241,7 @@ Review performance and produce updated strategy notes."""
     return result
 
 
-def format_telegram_signal(signal: dict, symbol: str, position_num: int) -> str:
+def format_telegram_signal(signal: dict, symbol: str, result: dict) -> str:
     """Format a trade signal for Telegram delivery."""
     direction = signal.get('direction', 'NONE')
     emoji = '🟢' if direction == 'LONG' else '🔴'
@@ -258,6 +265,7 @@ def format_telegram_signal(signal: dict, symbol: str, position_num: int) -> str:
     rr     = signal.get('rr_ratio')
     conf   = signal.get('confidence')
     dur    = signal.get('expected_duration', 'N/A')
+    leverage = signal.get('leverage', result.get('leverage', 1))
 
     sl_pct = abs(entry - sl) / entry * 100 if entry and sl else 0
     tp_pct = abs(tp - entry) / entry * 100 if entry and tp else 0
@@ -268,6 +276,9 @@ Entry:       ${entry:,.2f}
 Stop Loss:   ${sl:,.2f}  (-{sl_pct:.1f}%)
 Take Profit: ${tp:,.2f}  (+{tp_pct:.1f}%)
 Risk/Reward: {rr:.1f}R
+
+Leverage:    {leverage}x | Size: ${result['position_size']:,.2f}
+Margin:      ${result['margin_used']:,.2f} | Risk: ${result['risk_amount']:,.2f}
 
 Timeframes: 15m {tf_emoji(tf.get('15m'))}  1h {tf_emoji(tf.get('1h'))}  4h {tf_emoji(tf.get('4h'))}
 Confidence: {conf}%
@@ -281,7 +292,7 @@ Duration:   {dur}
 
 ⚠️ *Risks:* {risks_text}
 
-🧪 Paper trade #{position_num} | Strategy v{_get_strategy_version()}"""
+🧪 Paper trade #{result['id']} | Strategy v{_get_strategy_version()}"""
 
 
 def format_telegram_close(pos: dict) -> str:
@@ -549,19 +560,27 @@ def main():
         and signal.get('take_profit')
     ):
         total_positions = open_count + 1  # position number for display
-        pos_id = open_position(
+        leverage = signal.get('leverage') or 1
+        leverage = max(1, min(int(leverage), 20))
+        
+        result = open_position(
             signal_id=signal_id,
             symbol=SYMBOL,
             direction=direction,
             entry_price=signal['entry_price'],
             stop_loss=signal['stop_loss'],
             take_profit=signal['take_profit'],
+            leverage=leverage,
             strategy_notes=strategy_notes[:500],
         )
-        print(f"[trader] Opened paper position #{pos_id}")
-
-        msg = format_telegram_signal(signal, SYMBOL, pos_id)
-        telegram_messages.append(msg)
+        
+        if result.get('opened'):
+            pos_id = result['id']
+            print(f"[trader] Opened position #{pos_id} ({leverage}x leverage, size: ${result['position_size']:,.2f}, margin: ${result['margin_used']:,.2f}, risk: ${result['risk_amount']:,.2f})")
+            msg = format_telegram_signal(signal, SYMBOL, result)
+            telegram_messages.append(msg)
+        else:
+            print(f"[trader] Could not open position: {result.get('reason')}")
     else:
         if direction == 'NONE' or confidence < MIN_CONFIDENCE:
             print(f"[trader] No qualifying signal this scan")
