@@ -295,22 +295,38 @@ def open_position(
     entry_price: float,
     stop_loss: float,
     take_profit: float,
+    leverage: int = 1,
     strategy_notes: str = '',
-) -> int:
-    """Open a new paper position. Returns position ID."""
+) -> dict:
+    """
+    Open a new paper position with portfolio sizing and leverage.
+    Returns dict with position ID and sizing info, or {'opened': False, 'reason': ...}.
+    """
+    portfolio = get_portfolio()
+    sizing = calculate_position_size(portfolio['balance'], entry_price, stop_loss, leverage)
+    
+    if not sizing['can_trade']:
+        return {'opened': False, 'reason': sizing.get('reason', 'Cannot trade')}
+    
     conn = get_conn()
     c = conn.cursor()
     c.execute('''
         INSERT INTO positions
         (signal_id, opened_at, symbol, direction, entry_price,
-         stop_loss, take_profit, status, strategy_notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+         stop_loss, take_profit, status, strategy_notes,
+         position_size, risk_amount, fees, leverage, margin_used)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
     ''', (
         signal_id,
         datetime.now(timezone.utc).isoformat(),
         symbol, direction,
         entry_price, stop_loss, take_profit,
         strategy_notes,
+        sizing['position_size'],
+        sizing['risk_amount'],
+        sizing['entry_fee'],
+        sizing['leverage'],
+        sizing['margin_used'],
     ))
     pos_id = c.lastrowid
 
@@ -318,7 +334,20 @@ def open_position(
     c.execute('UPDATE signals SET acted_on=1 WHERE id=?', (signal_id,))
     conn.commit()
     conn.close()
-    return pos_id
+
+    # Deduct margin + entry fee from balance
+    new_balance = portfolio['balance'] - sizing['margin_used'] - sizing['entry_fee']
+    update_portfolio({'balance': round(new_balance, 2)})
+
+    return {
+        'opened': True,
+        'id': pos_id,
+        'position_size': sizing['position_size'],
+        'margin_used': sizing['margin_used'],
+        'risk_amount': sizing['risk_amount'],
+        'entry_fee': sizing['entry_fee'],
+        'leverage': sizing['leverage'],
+    }
 
 
 def get_open_positions(symbol: Optional[str] = None) -> list:
