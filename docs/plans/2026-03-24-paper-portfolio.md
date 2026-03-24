@@ -11,9 +11,9 @@
 **Design Decisions:**
 - Starting balance: $10,000
 - Risk per trade: 1% of current balance
-- Fees: 0.1% per side (entry + exit = 0.2% round trip) — matches Binance spot
-- Leverage: None (notional capped at balance — no margin)
-- Drawdown circuit breaker: Pause at 10% drawdown from peak
+- Fees: 0.1% per side (entry + exit = 0.2% round trip) — matches Binance futures
+- Leverage: 0-20x, chosen by LLM per trade based on confidence and setup quality
+- No drawdown circuit breaker (let the RL loop learn from losses)
 - Reset: Manual function to reset portfolio to $10,000
 
 ---
@@ -146,9 +146,9 @@ Add after the existing CREATE TABLE blocks (SQLite ALTER TABLE for new columns):
 
 ---
 
-## Task 3: Add position sizing calculation
+## Task 3: Add position sizing calculation with leverage support
 
-**Objective:** Calculate position size based on portfolio balance and risk %.
+**Objective:** Calculate position size based on portfolio balance, risk %, and LLM-chosen leverage.
 
 **Files:**
 - Modify: `/home/agentneo/hermes-trader/trade_log.py`
@@ -157,40 +157,58 @@ Add after the existing CREATE TABLE blocks (SQLite ALTER TABLE for new columns):
 
 ```python
 RISK_PER_TRADE_PCT = 0.01  # 1% of balance
-FEE_RATE = 0.001           # 0.1% per side (Binance spot)
+FEE_RATE = 0.001           # 0.1% per side (Binance futures)
 MIN_BALANCE = 500.0        # stop trading below this
+MAX_LEVERAGE = 20          # hard cap on leverage
 
 def calculate_position_size(
     balance: float,
     entry_price: float,
     stop_loss: float,
+    leverage: int = 1,
 ) -> dict:
     """
-    Calculate position size based on 1% risk rule.
+    Calculate position size based on 1% risk rule with leverage.
+    
+    Leverage amplifies position size but not the risk amount.
+    E.g. $10k balance, 1% risk = $100 risk. With 5x leverage the
+    notional position is larger, but the margin (collateral) used
+    is position_size / leverage.
     
     Returns dict with:
-        risk_amount: dollars at risk
-        position_size: notional position in USD
+        risk_amount: dollars at risk (always 1% of balance)
+        position_size: notional position in USD (amplified by leverage)
+        margin_used: actual collateral locked (position_size / leverage)
         quantity: amount of BTC
-        entry_fee: fee on entry
+        entry_fee: fee on entry (based on notional)
+        leverage: validated leverage used
         can_trade: whether balance supports this trade
     """
+    leverage = max(1, min(int(leverage), MAX_LEVERAGE))
+    
     risk_amount = balance * RISK_PER_TRADE_PCT
     sl_distance_pct = abs(entry_price - stop_loss) / entry_price
     
     if sl_distance_pct == 0:
         return {'can_trade': False, 'reason': 'SL distance is zero'}
     
-    # Position size = risk / SL distance
+    # Position size = risk / SL distance (base sizing from risk)
     position_size = risk_amount / sl_distance_pct
     
-    # Cap at available balance (no leverage)
-    if position_size > balance:
-        position_size = balance
+    # Apply leverage: allows notional to exceed balance
+    # But margin (collateral) must fit within balance
+    max_notional = balance * leverage
+    if position_size > max_notional:
+        position_size = max_notional
         risk_amount = position_size * sl_distance_pct
     
+    margin_used = position_size / leverage
     quantity = position_size / entry_price
     entry_fee = position_size * FEE_RATE
+    
+    # Check margin + fee fits in balance
+    if margin_used + entry_fee > balance:
+        return {'can_trade': False, 'reason': f'Insufficient margin: need ${margin_used + entry_fee:.2f}, have ${balance:.2f}'}
     
     if balance < MIN_BALANCE:
         return {'can_trade': False, 'reason': f'Balance ${balance:.2f} below minimum ${MIN_BALANCE:.2f}'}
@@ -199,33 +217,57 @@ def calculate_position_size(
         'can_trade': True,
         'risk_amount': round(risk_amount, 2),
         'position_size': round(position_size, 2),
+        'margin_used': round(margin_used, 2),
         'quantity': round(quantity, 8),
         'entry_fee': round(entry_fee, 2),
+        'leverage': leverage,
     }
 ```
 
-**Verify:** Run a quick calculation test:
+**Verify:** Run calculation tests:
 ```python
 python -c "
 from trade_log import calculate_position_size
+
+# 1x leverage (no leverage)
 r = calculate_position_size(10000, 70000, 69500)
-print(r)
-# Expected: position_size ~$14,000 (capped to $10,000), risk ~$100
+print(f'1x: size=${r[\"position_size\"]}, margin=${r[\"margin_used\"]}, risk=${r[\"risk_amount\"]}')
+
+# 5x leverage
+r = calculate_position_size(10000, 70000, 69500, leverage=5)
+print(f'5x: size=${r[\"position_size\"]}, margin=${r[\"margin_used\"]}, risk=${r[\"risk_amount\"]}')
+
+# 20x leverage
+r = calculate_position_size(10000, 70000, 69500, leverage=20)
+print(f'20x: size=${r[\"position_size\"]}, margin=${r[\"margin_used\"]}, risk=${r[\"risk_amount\"]}')
 "
 ```
 
-**Commit:** `feat: add position sizing calculation`
+**Commit:** `feat: add position sizing with leverage support (1-20x)`
 
 ---
 
-## Task 4: Update open_position to use sizing and deduct from balance
+## Task 4: Update open_position to use sizing with leverage
 
-**Objective:** When opening a position, calculate size, deduct entry fee, record sizing in DB.
+**Objective:** When opening a position, calculate size with leverage, deduct margin + fee, record in DB.
 
 **Files:**
 - Modify: `/home/agentneo/hermes-trader/trade_log.py`
 
-**Step 1: Update `open_position()` signature and logic**
+**Step 1: Add leverage column migration to `init_db()`**
+
+```python
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN leverage INTEGER DEFAULT 1')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN margin_used REAL')
+    except sqlite3.OperationalError:
+        pass
+```
+
+**Step 2: Update `open_position()` signature and logic**
 
 ```python
 def open_position(
@@ -235,14 +277,15 @@ def open_position(
     entry_price: float,
     stop_loss: float,
     take_profit: float,
+    leverage: int = 1,
     strategy_notes: str = '',
 ) -> dict:
     """
-    Open a new paper position with portfolio sizing.
-    Returns dict with position ID and sizing info, or None if can't trade.
+    Open a new paper position with portfolio sizing and leverage.
+    Returns dict with position ID and sizing info, or {'opened': False, 'reason': ...}.
     """
     portfolio = get_portfolio()
-    sizing = calculate_position_size(portfolio['balance'], entry_price, stop_loss)
+    sizing = calculate_position_size(portfolio['balance'], entry_price, stop_loss, leverage)
     
     if not sizing['can_trade']:
         return {'opened': False, 'reason': sizing.get('reason', 'Cannot trade')}
@@ -253,8 +296,8 @@ def open_position(
         INSERT INTO positions
         (signal_id, opened_at, symbol, direction, entry_price,
          stop_loss, take_profit, status, strategy_notes,
-         position_size, risk_amount, fees)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
+         position_size, risk_amount, fees, leverage, margin_used)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
     ''', (
         signal_id,
         datetime.now(timezone.utc).isoformat(),
@@ -264,6 +307,8 @@ def open_position(
         sizing['position_size'],
         sizing['risk_amount'],
         sizing['entry_fee'],
+        sizing['leverage'],
+        sizing['margin_used'],
     ))
     pos_id = c.lastrowid
 
@@ -272,22 +317,24 @@ def open_position(
     conn.commit()
     conn.close()
 
-    # Deduct entry fee from balance
-    new_balance = portfolio['balance'] - sizing['entry_fee']
+    # Deduct margin + entry fee from balance
+    new_balance = portfolio['balance'] - sizing['margin_used'] - sizing['entry_fee']
     update_portfolio({'balance': round(new_balance, 2)})
 
     return {
         'opened': True,
         'id': pos_id,
         'position_size': sizing['position_size'],
+        'margin_used': sizing['margin_used'],
         'risk_amount': sizing['risk_amount'],
         'entry_fee': sizing['entry_fee'],
+        'leverage': sizing['leverage'],
     }
 ```
 
 **Note:** This changes the return type from `int` to `dict`. trader.py will need updating in Task 6.
 
-**Commit:** `feat: integrate position sizing into open_position`
+**Commit:** `feat: integrate position sizing with leverage into open_position`
 
 ---
 
@@ -339,12 +386,14 @@ Update the UPDATE query to include new fields:
     ))
 ```
 
-After DB update, update portfolio:
+After DB update, update portfolio (return margin to balance + apply P&L):
 
 ```python
     # Update portfolio balance
+    # Margin is returned, then P&L applied on top
     portfolio = get_portfolio()
-    new_balance = portfolio['balance'] + pnl_usd_net  # net of exit fee
+    margin_used = pos.get('margin_used') or 0
+    new_balance = portfolio['balance'] + margin_used + pnl_usd_net  # margin back + net P&L
     new_total_pnl = portfolio['total_pnl'] + pnl_usd_net
     new_total_fees = portfolio['total_fees'] + total_fees
     new_trades = portfolio['trades_taken'] + 1
@@ -363,33 +412,37 @@ After DB update, update portfolio:
 
 ---
 
-## Task 6: Update trader.py to use new open_position return type
+## Task 6: Update LLM prompt to choose leverage and update trader.py
 
-**Objective:** Handle the dict return from open_position and add drawdown check.
+**Objective:** Have the LLM choose leverage (1-20x) per trade. Update trader.py to handle the new open_position return type and pass leverage through.
 
 **Files:**
 - Modify: `/home/agentneo/hermes-trader/trader.py`
 
-**Step 1: Add config constant**
+**Step 1: Update LLM response schema in `analyse_market()`**
+
+Add `leverage` to the JSON response format in the system prompt:
 
 ```python
-MAX_DRAWDOWN_PCT = 10.0  # pause trading if drawdown exceeds this
+  "leverage": 1-20,          // 1 = no leverage, higher = more aggressive
 ```
 
-**Step 2: Add drawdown check before opening position**
+Add a leverage guidance rule:
 
-In `main()`, before the position-opening block, add:
+```
+- Choose leverage 1-20x based on setup quality:
+  - 1x: uncertain/low confidence setups
+  - 2-5x: moderate confidence, aligned timeframes
+  - 5-10x: high confidence, strong trend alignment, clear levels
+  - 10-20x: exceptional setups only — all timeframes aligned, high volume, clear breakout
+- Higher leverage = higher risk. Be conservative with leverage unless the setup is exceptional.
+```
+
+**Step 2: Extract leverage from signal in `main()`**
 
 ```python
-    # Check portfolio health
-    from trade_log import get_portfolio
-    portfolio = get_portfolio()
-    drawdown = 0
-    if portfolio['peak_equity'] > 0:
-        drawdown = (portfolio['peak_equity'] - portfolio['balance']) / portfolio['peak_equity'] * 100
-    
-    if drawdown >= MAX_DRAWDOWN_PCT:
-        print(f"[trader] CIRCUIT BREAKER: {drawdown:.1f}% drawdown exceeds {MAX_DRAWDOWN_PCT}% limit — no new trades")
+    leverage = signal.get('leverage') or 1
+    leverage = max(1, min(int(leverage), 20))
 ```
 
 **Step 3: Update the position-opening block**
@@ -400,19 +453,36 @@ pos_id = open_position(...)
 ```
 To:
 ```python
-result = open_position(...)
+result = open_position(
+    signal_id=signal_id,
+    symbol=SYMBOL,
+    direction=direction,
+    entry_price=signal['entry_price'],
+    stop_loss=signal['stop_loss'],
+    take_profit=signal['take_profit'],
+    leverage=leverage,
+    strategy_notes=strategy_notes[:500],
+)
 if result.get('opened'):
     pos_id = result['id']
-    print(f"[trader] Opened paper position #{pos_id} (size: ${result['position_size']:,.2f}, risk: ${result['risk_amount']:,.2f})")
+    print(f"[trader] Opened position #{pos_id} ({leverage}x leverage, size: ${result['position_size']:,.2f}, margin: ${result['margin_used']:,.2f}, risk: ${result['risk_amount']:,.2f})")
     msg = format_telegram_signal(signal, SYMBOL, pos_id)
     telegram_messages.append(msg)
 else:
     print(f"[trader] Could not open position: {result.get('reason')}")
 ```
 
-**Verify:** Run a manual scan and check output includes sizing info.
+**Step 4: Update `format_telegram_signal()` to show leverage and sizing**
 
-**Commit:** `feat: add drawdown circuit breaker and position sizing to trader`
+Add to the signal message:
+```python
+Leverage: {signal.get('leverage', 1)}x
+Size: ${result['position_size']:,.2f} (margin: ${result['margin_used']:,.2f})
+```
+
+**Verify:** Run a manual scan and check output includes leverage info.
+
+**Commit:** `feat: LLM chooses leverage 1-20x per trade`
 
 ---
 
@@ -539,7 +609,12 @@ Add to the existing stats dict:
 
 | File | Changes |
 |------|---------|
-| `trade_log.py` | New portfolio table, get/update/reset functions, position sizing, dollar P&L on close, enhanced stats |
-| `trader.py` | Drawdown circuit breaker, new open_position return handling, portfolio in Telegram report |
+| `trade_log.py` | New portfolio table, get/update/reset functions, position sizing with leverage (1-20x), margin tracking, dollar P&L on close, enhanced stats |
+| `trader.py` | LLM prompt updated to choose leverage, new open_position return handling, portfolio + leverage in Telegram report, format_telegram_signal updated with sizing |
 
 **Total estimated effort:** 9 tasks, ~45 minutes implementation time.
+
+**Key flows:**
+- Open: LLM chooses leverage → calculate_position_size(balance, entry, SL, leverage) → deduct margin + fee from balance → store position
+- Close: Calculate dollar P&L on notional → deduct exit fee → return margin to balance → update portfolio totals
+- Report: Show balance, return %, P&L, fees, drawdown, leverage per position
