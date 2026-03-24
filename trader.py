@@ -325,6 +325,101 @@ Total R: {stats.get('total_r', 0):.2f}R
 📋 {review.get('review_summary', '')}"""
 
 
+def format_telegram_report(
+    symbol: str,
+    current_price: float,
+    tf_signals: dict,
+    signal: dict,
+    open_positions: list,
+    stats: dict,
+) -> str:
+    """Format a full scan report for Telegram — sent every 5 minutes."""
+
+    def trend_emoji(bias):
+        if bias == 'bullish': return '🟢'
+        if bias == 'bearish': return '🔴'
+        return '🟡'
+
+    def fmt(val, decimals=2):
+        if val is None: return 'N/A'
+        return f"{val:.{decimals}f}"
+
+    # Market section per timeframe
+    tf_lines = []
+    for tf in ['15m', '1h', '4h']:
+        d = tf_signals.get(tf, {})
+        bias = d.get('trend_bias', 'N/A')
+        emoji = trend_emoji(bias)
+        rsi = fmt(d.get('rsi'), 1)
+        macd = fmt(d.get('macd'), 2)
+        macd_sig = fmt(d.get('macd_signal'), 2)
+        ema9 = fmt(d.get('ema_9'), 0)
+        ema20 = fmt(d.get('ema_20'), 0)
+        ema50 = fmt(d.get('ema_50'), 0)
+        bb = fmt(d.get('bb_position'), 0) if d.get('bb_position') is not None else 'N/A'
+        tf_lines.append(
+            f"{tf:>3} {emoji} {bias.upper():8s} | RSI {rsi:>5} | MACD {macd}/{macd_sig}\n"
+            f"     EMA 9/20/50: {ema9}/{ema20}/{ema50} | BB: {bb}%"
+        )
+    market_text = '\n'.join(tf_lines)
+
+    # Signal assessment
+    direction = signal.get('direction', 'NONE')
+    confidence = signal.get('confidence', 0)
+    rr = signal.get('rr_ratio') or 0
+    reasoning = signal.get('reasoning', 'N/A')
+    if direction == 'NONE':
+        sig_emoji = '⏸'
+        sig_action = 'NO TRADE'
+    elif confidence >= MIN_CONFIDENCE and rr >= MIN_RR:
+        sig_emoji = '🟢' if direction == 'LONG' else '🔴'
+        sig_action = f'{direction} OPENED'
+    else:
+        sig_emoji = '⚠️'
+        sig_action = f'{direction} REJECTED'
+
+    # Positions section
+    if open_positions:
+        pos_lines = []
+        for p in open_positions:
+            pos_lines.append(
+                f"  #{p['id']} {p['direction']} @ ${p['entry_price']:,.2f} "
+                f"SL ${p['stop_loss']:,.2f} TP ${p['take_profit']:,.2f}"
+            )
+        pos_text = '\n'.join(pos_lines)
+    else:
+        pos_text = '  None'
+
+    # Stats
+    total = stats.get('total', 0)
+    if total > 0:
+        stats_text = (
+            f"Trades: {total} | Win rate: {stats.get('win_rate', 0):.0f}% | "
+            f"Avg R: {stats.get('avg_r', 0):.2f} | Total R: {stats.get('total_r', 0):.2f}"
+        )
+    else:
+        stats_text = 'No closed trades yet'
+
+    return f"""📊 BTC/USDT SCAN REPORT
+━━━━━━━━━━━━━━━━━━━━━
+💰 Price: ${current_price:,.2f}
+
+📈 MARKET:
+{market_text}
+
+{sig_emoji} SIGNAL: {sig_action}
+Confidence: {confidence}% | R:R: {rr:.1f}
+{reasoning[:300]}
+
+📋 OPEN POSITIONS:
+{pos_text}
+
+📊 RECORD:
+{stats_text}
+
+🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')} | v{_get_strategy_version()}"""
+
+
 def _get_strategy_version() -> str:
     """Extract version number from strategy_notes.md."""
     try:
@@ -475,12 +570,23 @@ def main():
         elif open_count >= MAX_OPEN_POSITIONS:
             print(f"[trader] Max positions open — skipped")
 
-    # Send ONE consolidated Telegram message at the end
+    # Send event notifications (position closes, reviews, new trades) first
     if telegram_messages:
-        # Group by timestamp - position closes and reviews go first, then signal/no-signal
         consolidated = "\n\n────────────────────────\n\n".join(telegram_messages)
         notify_telegram(consolidated)
-        print(f"[trader] Sent {len(telegram_messages)} notification(s) in consolidated message")
+        print(f"[trader] Sent {len(telegram_messages)} event notification(s)")
+
+    # Always send full scan report
+    stats = get_stats(last_n=20)
+    report = format_telegram_report(
+        symbol=SYMBOL,
+        current_price=current_price,
+        tf_signals=tf_signals,
+        signal=signal,
+        open_positions=get_open_positions(SYMBOL),
+        stats=stats,
+    )
+    notify_telegram(report)
 
     print(f"[trader] Scan complete")
 
