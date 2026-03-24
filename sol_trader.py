@@ -28,7 +28,7 @@ from trade_log import (
     init_db, log_signal, open_position, check_and_close_positions,
     get_open_positions, get_closed_trades, get_stats,
     count_closed_since_last_review, log_strategy_review,
-    get_portfolio,
+    get_portfolio, get_available_margin,
 )
 
 # Import config from shared module
@@ -39,6 +39,10 @@ from config import (
     STRATEGY_NOTES_PATH, TELEGRAM_NOTIFY_PATH,
     llm_call,
 )
+
+# Override SYMBOL and strategy notes path for this specific asset
+SYMBOL = 'SOL/USDT'
+STRATEGY_NOTES_PATH = TRADER_DIR / 'strategy_notes_SOL_USDT.md'
 
 # Load strategy notes once
 def load_strategy_notes() -> str:
@@ -397,11 +401,48 @@ def main():
             tf_signals[tf] = {}
             print(f"[trader] Insufficient data for {tf}")
     
-    # 6. Format indicator summary for LLM
+    # 6. Fetch BTC 4h data for correlation check
+    try:
+        from market_data import fetch_candles
+        
+        btc_df = fetch_candles('BTC/USDT', '4h', limit=250)
+        btc_current = get_current_price('BTC/USDT')
+        btc_rsi = btc_ema = btc_macd = btc_bb = None
+        
+        if btc_df is not None and len(btc_df) >= 50:
+            btc_enriched = calculate_indicators(btc_df)
+            btc_rsi = btc_enriched.iloc[-1].get('rsi')
+            btc_ema9 = btc_enriched.iloc[-1].get('ema_9')
+            btc_ema50 = btc_enriched.iloc[-1].get('ema_50')
+            btc_macd = btc_enriched.iloc[-1].get('macd')
+            btc_macd_signal = btc_enriched.iloc[-1].get('macd_signal')
+            btc_bb_position = btc_enriched.iloc[-1].get('bb_position') if 'bb_position' in btc_enriched.columns else None
+    except Exception as e:
+        print(f"[trader] BTC data fetch failed: {e}")
+        btc_current = btc_rsi = btc_ema = btc_macd = btc_bb = None
+
+    # 7. Format indicator summary for LLM
     indicator_text = format_indicators_for_llm(tf_signals, SYMBOL)
     indicator_text += f"\nCurrent price: ${current_price:,.2f}"
     
-    # 7. Check how many positions are open
+    # Add BTC correlation data
+    if btc_current:
+        indicator_text += f"\n\n=== BTC/USDT 4h CORRELATION DATA ===\n"
+        indicator_text += f"Current: ${btc_current:,.2f}\n"
+        if btc_rsi:
+            indicator_text += f"RSI(14): {btc_rsi:.1f}"
+            if btc_rsi > 75: indicator_text += " (OVERBOUGHT)"
+            elif btc_rsi < 25: indicator_text += " (OVERSOLD)"
+            indicator_text += "\n"
+        if btc_ema9 and btc_ema50:
+            indicator_text += f"EMA: {btc_ema9:.0f} / {btc_ema50:.0f} ({'BULLISH' if btc_ema9 > btc_ema50 else 'BEARISH'})\n"
+        if btc_macd is not None and btc_macd_signal is not None:
+            indicator_text += f"MACD: {btc_macd:.2f} / Signal: {btc_macd_signal:.2f} ({'BULLISH' if btc_macd > btc_macd_signal else 'BEARISH'})\n"
+        indicator_text += "Major S/R levels: $60k, $65k, $70k, $75k\n"
+        btc_near_level = any(abs(btc_current - lvl) / lvl < 0.01 for lvl in [60000, 65000, 70000, 75000])
+        indicator_text += f"BTC within 1% of major level: {'YES' if btc_near_level else 'NO'}\n"
+    
+    # 8. Check how many positions are open
     open_positions = get_open_positions(SYMBOL)
     open_count = len(open_positions)
     print(f"[trader] Open positions: {open_count}/{MAX_OPEN_POSITIONS}")

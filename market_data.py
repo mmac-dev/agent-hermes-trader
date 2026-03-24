@@ -10,9 +10,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 TIMEFRAMES = {
-    "15m": {"limit": 100, "label": "15-minute"},
-    "1h":  {"limit": 100, "label": "1-hour"},
-    "4h":  {"limit": 100, "label": "4-hour"},
+    "15m": {"limit": 250, "label": "15-minute"},
+    "1h":  {"limit": 250, "label": "1-hour"},
+    "4h":  {"limit": 250, "label": "4-hour"},
 }
 
 

@@ -351,7 +351,7 @@ def open_position(
 
 
 def get_open_positions(symbol: Optional[str] = None) -> list:
-    """Return all open paper positions."""
+    """Return all open paper positions, optionally filtered by symbol."""
     conn = get_conn()
     c = conn.cursor()
     if symbol:
@@ -361,6 +361,18 @@ def get_open_positions(symbol: Optional[str] = None) -> list:
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
+
+
+def get_available_margin() -> float:
+    """Calculate available margin across all positions for portfolio-based sizing."""
+    portfolio = get_portfolio()
+    balance = portfolio['balance']
+    
+    # Sum margin used by all open positions
+    open_positions = get_open_positions(symbol=None)  # All symbols
+    total_margin = sum(p.get('margin_used', 0) or 0 for p in open_positions)
+    
+    return balance - total_margin
 
 
 def close_position(
@@ -502,26 +514,36 @@ def check_and_close_positions(current_prices: dict, position_timeout_hours: int 
 
 # --- Stats methods ---
 
-def get_closed_trades(limit: int = 50) -> list:
-    """Return recent closed positions."""
+def get_closed_trades(limit: int = 50, symbol: str = None) -> list:
+    """Return recent closed positions, optionally filtered by symbol."""
     conn = get_conn()
     c = conn.cursor()
-    c.execute('''
-        SELECT p.*, s.reasoning, s.confidence, s.tf_1h
-        FROM positions p
-        LEFT JOIN signals s ON p.signal_id = s.id
-        WHERE p.status = 'CLOSED'
-        ORDER BY p.closed_at DESC
-        LIMIT ?
-    ''', (limit,))
+    if symbol:
+        c.execute('''
+            SELECT p.*, s.reasoning, s.confidence, s.tf_1h
+            FROM positions p
+            LEFT JOIN signals s ON p.signal_id = s.id
+            WHERE p.status = 'CLOSED' AND p.symbol = ?
+            ORDER BY p.closed_at DESC
+            LIMIT ?
+        ''', (symbol, limit))
+    else:
+        c.execute('''
+            SELECT p.*, s.reasoning, s.confidence, s.tf_1h
+            FROM positions p
+            LEFT JOIN signals s ON p.signal_id = s.id
+            WHERE p.status = 'CLOSED'
+            ORDER BY p.closed_at DESC
+            LIMIT ?
+        ''', (limit,))
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
 
 
-def get_stats(last_n: int = 20) -> dict:
-    """Calculate win rate, avg R, streak for last N closed trades."""
-    trades = get_closed_trades(limit=last_n)
+def get_stats(last_n: int = 20, symbol: str = None) -> dict:
+    """Calculate win rate, avg R, streak, max drawdown for last N closed trades."""
+    trades = get_closed_trades(limit=last_n, symbol=symbol)
     if not trades:
         return {'total': 0}
 
@@ -529,29 +551,75 @@ def get_stats(last_n: int = 20) -> dict:
     losses = [t for t in trades if (t['pnl_r'] or 0) <= 0]
     pnl_rs = [t['pnl_r'] or 0 for t in trades]
 
+    # Average trade duration
+    durations = []
+    for t in trades:
+        if t.get('opened_at') and t.get('closed_at'):
+            try:
+                opened = datetime.fromisoformat(t['opened_at'].replace('Z', '+00:00'))
+                closed = datetime.fromisoformat(t['closed_at'].replace('Z', '+00:00'))
+                durations.append((closed - opened).total_seconds() / 3600)
+            except (ValueError, TypeError):
+                pass
+
+    # Win/loss streak (consecutive)
+    streak = 0
+    streak_type = None
+    for t in trades:
+        r = t.get('pnl_r') or 0
+        if streak_type is None:
+            streak_type = 'win' if r > 0 else 'loss'
+            streak = 1
+        elif (r > 0 and streak_type == 'win') or (r <= 0 and streak_type == 'loss'):
+            streak += 1
+        else:
+            break
+
+    # Max drawdown in R terms (peak-to-trough)
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for r in pnl_rs:
+        cumulative += r
+        if cumulative > peak:
+            peak = cumulative
+        drawdown = peak - cumulative
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+    # Dollar P&L totals
+    total_pnl_usd = sum(t.get('pnl_usd') or 0 for t in trades)
+
     return {
-        'total':    len(trades),
-        'wins':     len(wins),
-        'losses':   len(losses),
-        'win_rate': round(len(wins) / len(trades) * 100, 1),
-        'avg_r':    round(sum(pnl_rs) / len(pnl_rs), 3),
-        'total_r':  round(sum(pnl_rs), 3),
-        'best_r':   round(max(pnl_rs), 3),
-        'worst_r':  round(min(pnl_rs), 3),
+        'total':          len(trades),
+        'wins':           len(wins),
+        'losses':         len(losses),
+        'win_rate':       round(len(wins) / len(trades) * 100, 1),
+        'avg_r':          round(sum(pnl_rs) / len(pnl_rs), 3),
+        'total_r':        round(sum(pnl_rs), 3),
+        'best_r':         round(max(pnl_rs), 3),
+        'worst_r':        round(min(pnl_rs), 3),
+        'avg_duration':   round(sum(durations) / len(durations), 1) if durations else 0,
+        'current_streak': f"{streak} {'win' if streak_type == 'win' else 'loss'}" if streak_type else 'N/A',
+        'max_drawdown_r': round(max_drawdown, 3),
+        'total_pnl_usd':  round(total_pnl_usd, 2),
     }
 
 
-def count_closed_since_last_review() -> int:
-    """Count trades closed after the last strategy review."""
+def count_closed_since_last_review(symbol: str = 'BTC/USDT') -> int:
+    """Count trades closed after the last strategy review for this symbol."""
     conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT reviewed_at FROM strategy_reviews ORDER BY reviewed_at DESC LIMIT 1')
+    c.execute(
+        'SELECT reviewed_at FROM strategy_reviews WHERE symbol=? ORDER BY reviewed_at DESC LIMIT 1',
+        (symbol,)
+    )
     row = c.fetchone()
     last_review = row['reviewed_at'] if row else '1970-01-01'
-
+    
     c.execute(
-        "SELECT COUNT(*) as cnt FROM positions WHERE status='CLOSED' AND closed_at > ?",
-        (last_review,)
+        "SELECT COUNT(*) as cnt FROM positions WHERE status='CLOSED' AND symbol=? AND closed_at > ?",
+        (symbol, last_review)
     )
     cnt = c.fetchone()['cnt']
     conn.close()
@@ -564,18 +632,19 @@ def log_strategy_review(
     avg_rr: float,
     summary: str,
     changes_made: str,
+    symbol: str = 'BTC/USDT',
 ):
-    """Log a strategy review."""
+    """Log a strategy review for a specific symbol."""
     conn = get_conn()
     c = conn.cursor()
     c.execute('''
         INSERT INTO strategy_reviews
-        (reviewed_at, trades_since_last, win_rate, avg_rr, summary, changes_made)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (reviewed_at, trades_since_last, win_rate, avg_rr, summary, changes_made, symbol)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     ''', (
         datetime.now(timezone.utc).isoformat(),
         trades_reviewed, win_rate, avg_rr,
-        summary, changes_made,
+        summary, changes_made, symbol,
     ))
     conn.commit()
     conn.close()

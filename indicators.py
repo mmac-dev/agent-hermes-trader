@@ -108,16 +108,16 @@ def extract_signal_data(df: pd.DataFrame) -> dict:
     if price and bbl and bbu and (bbu - bbl) > 0:
         bb_position = round((price - bbl) / (bbu - bbl), 3)
 
-    # Trend bias from EMA stack
+    # Trend bias — 3-condition standard (consistent with strategy notes)
+    # BULLISH: price > EMA50 AND EMA20 > EMA50 AND RSI > 50
+    # BEARISH: price < EMA50 AND EMA20 < EMA50 AND RSI < 50
+    # NEUTRAL: everything else
+    rsi = safe('rsi')
     trend = 'neutral'
-    if price and ema20 and ema50 and ema200:
-        if price > ema20 > ema50 > ema200:
-            trend = 'strong_bullish'
-        elif price > ema20 > ema50:
+    if price and ema20 and ema50 and rsi:
+        if price > ema50 and ema20 > ema50 and rsi > 50:
             trend = 'bullish'
-        elif price < ema20 < ema50 < ema200:
-            trend = 'strong_bearish'
-        elif price < ema20 < ema50:
+        elif price < ema50 and ema20 < ema50 and rsi < 50:
             trend = 'bearish'
 
     return {
@@ -195,13 +195,22 @@ def format_indicators_for_llm(signals: dict, symbol: str) -> str:
             lines.append("  MACD: N/A")
 
         bb_pos = data.get('bb_position')
+        bb_w   = data.get('bb_width')
         if bb_pos is not None:
             if bb_pos > 0.8:   bb_note = ' (near upper band)'
             elif bb_pos < 0.2: bb_note = ' (near lower band)'
             else:              bb_note = ' (mid-range)'
             lines.append(f"  BB position: {bb_pos:.2f}{bb_note}")
         else:
-            lines.append("  BB: N/A")
+            lines.append("  BB position: N/A")
+        if bb_w is not None:
+            if bb_w < 0.3:    bw_note = ' (EXTREME COMPRESSION)'
+            elif bb_w < 0.8:  bw_note = ' (consolidating)'
+            elif bb_w > 1.5:  bw_note = ' (expanding — trend confirmation)'
+            else:             bw_note = ''
+            lines.append(f"  BB width: {bb_w:.2f}%{bw_note}")
+        else:
+            lines.append("  BB width: N/A")
 
         atr = data.get('atr')
         lines.append(f"  ATR(14): {atr:.2f}" if atr else "  ATR: N/A")
