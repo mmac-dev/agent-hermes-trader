@@ -66,6 +66,32 @@ def init_db():
         )
     ''')
 
+    # Migration: add leverage and sizing columns to positions (safe to re-run)
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN leverage INTEGER DEFAULT 1')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN margin_used REAL')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN position_size REAL')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN risk_amount REAL')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN pnl_usd REAL DEFAULT 0.0')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE positions ADD COLUMN fees REAL DEFAULT 0.0')
+    except sqlite3.OperationalError:
+        pass
+
     # Strategy review history
     c.execute('''
         CREATE TABLE IF NOT EXISTS strategy_reviews (
