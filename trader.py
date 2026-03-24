@@ -343,6 +343,7 @@ def format_telegram_report(
     signal: dict,
     open_positions: list,
     stats: dict,
+    portfolio: dict = None,
 ) -> str:
     """Format a full scan report for Telegram — sent every 5 minutes."""
 
@@ -389,12 +390,31 @@ def format_telegram_report(
         sig_emoji = '⚠️'
         sig_action = f'{direction} REJECTED'
 
+    # Portfolio section
+    if portfolio:
+        balance = portfolio.get('balance', 10000)
+        starting = portfolio.get('starting_balance', 10000)
+        total_pnl = portfolio.get('total_pnl', 0)
+        total_fees = portfolio.get('total_fees', 0)
+        peak = portfolio.get('peak_equity', balance)
+        return_pct = ((balance - starting) / starting) * 100
+        drawdown = ((peak - balance) / peak) * 100 if peak > 0 else 0
+        
+        portfolio_text = (
+            f"Balance: ${balance:,.2f} ({'+' if return_pct >= 0 else ''}{return_pct:.1f}%)\n"
+            f"Gross P&L: ${'+' if total_pnl >= 0 else ''}{total_pnl:,.2f} | Fees: ${total_fees:,.2f}\n"
+            f"Net: ${'+' if (total_pnl - total_fees) >= 0 else ''}{total_pnl - total_fees:,.2f} | Drawdown: {drawdown:.1f}%"
+        )
+    else:
+        portfolio_text = 'No portfolio data'
+
     # Positions section
     if open_positions:
         pos_lines = []
         for p in open_positions:
+            leverage_info = f" {p.get('leverage', 1)}x" if p.get('leverage') else ""
             pos_lines.append(
-                f"  #{p['id']} {p['direction']} @ ${p['entry_price']:,.2f} "
+                f"  #{p['id']} {p['direction']}{leverage_info} @ ${p['entry_price']:,.2f} "
                 f"SL ${p['stop_loss']:,.2f} TP ${p['take_profit']:,.2f}"
             )
         pos_text = '\n'.join(pos_lines)
@@ -406,7 +426,8 @@ def format_telegram_report(
     if total > 0:
         stats_text = (
             f"Trades: {total} | Win rate: {stats.get('win_rate', 0):.0f}% | "
-            f"Avg R: {stats.get('avg_r', 0):.2f} | Total R: {stats.get('total_r', 0):.2f}"
+            f"Avg R: {stats.get('avg_r', 0):.2f} | Total R: {stats.get('total_r', 0):.2f}\n"
+            f"Total P&L: ${'+' if stats.get('total_pnl_usd', 0) >= 0 else ''}{stats.get('total_pnl_usd', 0):,.2f}"
         )
     else:
         stats_text = 'No closed trades yet'
@@ -414,6 +435,9 @@ def format_telegram_report(
     return f"""📊 BTC/USDT SCAN REPORT
 ━━━━━━━━━━━━━━━━━━━━━
 💰 Price: ${current_price:,.2f}
+
+💰 PORTFOLIO:
+{portfolio_text}
 
 📈 MARKET:
 {market_text}
@@ -597,6 +621,7 @@ def main():
 
     # Always send full scan report
     stats = get_stats(last_n=20)
+    portfolio = get_portfolio()
     report = format_telegram_report(
         symbol=SYMBOL,
         current_price=current_price,
@@ -604,6 +629,7 @@ def main():
         signal=signal,
         open_positions=get_open_positions(SYMBOL),
         stats=stats,
+        portfolio=portfolio,
     )
     notify_telegram(report)
 
